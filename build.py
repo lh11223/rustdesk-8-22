@@ -1028,6 +1028,34 @@ def _brand_internal():
         f.write("".join(out))
     print("[brand] baked server=%s key_len=%d" % (server, len(key)))
 
+    # 清掉历史遗留的旧服务器地址（老 fork 在别处硬编码的 API server 等）
+    legacy = os.environ.get("RS_BRAND_LEGACY", "").strip()
+    if not legacy:
+        print("[brand] RS_BRAND_LEGACY not set, skip legacy cleanup")
+        return
+    exts = (".rs", ".dart", ".toml", ".json", ".txt", ".rc", ".xml")
+    changed = 0
+    for root in ("src", "libs", "flutter/lib", "res"):
+        if not os.path.isdir(root):
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in (".git", "target", "build")]
+            for fn in filenames:
+                if not fn.endswith(exts):
+                    continue
+                fp = os.path.join(dirpath, fn)
+                try:
+                    with open(fp, encoding="utf-8") as f:
+                        txt = f.read()
+                except (UnicodeDecodeError, OSError):
+                    continue
+                if legacy in txt:
+                    with open(fp, "w", encoding="utf-8") as f:
+                        f.write(txt.replace(legacy, server))
+                    changed += 1
+                    print("[brand] legacy %s -> %s  in  %s" % (legacy, server, fp))
+    print("[brand] legacy replaced in %d file(s)" % changed)
+
 
 def main():
     global skip_cargo
