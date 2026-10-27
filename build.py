@@ -997,10 +997,43 @@ def build_flutter_windows(version, features, skip_portable_pack):
         f'output location: {os.path.abspath(os.curdir)}/rustdesk-{version}-install.exe')
 
 
+def _brand_internal():
+    """Compile-time branding: bake internal rendezvous server + public key in."""
+    server = os.environ.get("RS_BRAND_SERVER", "").strip()
+    key = os.environ.get("RS_BRAND_KEY", "").strip()
+    if not server or not key:
+        print("[brand] RS_BRAND_SERVER / RS_BRAND_KEY not set, keep upstream defaults")
+        return
+    p = os.path.join("libs", "hbb_common", "src", "config.rs")
+    if not os.path.exists(p):
+        print("[brand] WARNING: %s not found, skip" % p)
+        return
+    with open(p, encoding="utf-8") as f:
+        lines = f.read().splitlines(True)
+    hit = 0
+    out = []
+    for ln in lines:
+        s = ln.lstrip()
+        if s.startswith("pub const RENDEZVOUS_SERVERS"):
+            ln = 'pub const RENDEZVOUS_SERVERS: &[&str] = &["%s"];\n' % server
+            hit += 1
+        elif s.startswith("pub const RS_PUB_KEY"):
+            ln = 'pub const RS_PUB_KEY: &str = "%s";\n' % key
+            hit += 1
+        out.append(ln)
+    if hit < 2:
+        print("[brand] WARNING: matched %d/2 constants, config.rs left untouched" % hit)
+        return
+    with open(p, "w", encoding="utf-8") as f:
+        f.write("".join(out))
+    print("[brand] baked server=%s key_len=%d" % (server, len(key)))
+
+
 def main():
     global skip_cargo
     parser = make_parser()
     args = parser.parse_args()
+    _brand_internal()
 
     # Before anything with a side effect: this is a query, and a caller uses it to build the very
     # binary it will then package. `get_features` stays the single definition of what a flag
