@@ -997,6 +997,75 @@ def build_flutter_windows(version, features, skip_portable_pack):
         f'output location: {os.path.abspath(os.curdir)}/rustdesk-{version}-install.exe')
 
 
+# 注入到 src/common.rs：启动时把内网服务器写进本地配置
+RUST_APPLY_FN = """
+/// internal brand: persist the internal server into local config on startup.
+///
+/// Baking the address into RENDEZVOUS_SERVERS alone is not enough:
+/// RustDesk decides "using public server" purely by checking whether the
+/// `custom-rendezvous-server` option is empty, so the UI keeps telling the
+/// user to self-host even though it is already talking to our server.
+pub fn brand_apply_options() {
+    const BRAND_SERVER: &str = "__SERVER__";
+    const BRAND_KEY: &str = "__KEY__";
+    const BRAND_API: &str = "__API__";
+    if Config::get_option("custom-rendezvous-server") != BRAND_SERVER {
+        Config::set_option(
+            "custom-rendezvous-server".to_owned(),
+            BRAND_SERVER.to_owned(),
+        );
+    }
+    if Config::get_option("relay-server") != BRAND_SERVER {
+        Config::set_option("relay-server".to_owned(), BRAND_SERVER.to_owned());
+    }
+    if Config::get_option("key") != BRAND_KEY {
+        Config::set_option("key".to_owned(), BRAND_KEY.to_owned());
+    }
+    if !BRAND_API.is_empty() && Config::get_option("api-server") != BRAND_API {
+        Config::set_option("api-server".to_owned(), BRAND_API.to_owned());
+    }
+}
+"""
+
+
+def _brand_rust_runtime(server, key, api):
+    """把 brand_apply_options() 追加进 src/common.rs，并在 core_main() 里调用它。"""
+    fn = (RUST_APPLY_FN
+          .replace("__SERVER__", server)
+          .replace("__KEY__", key)
+          .replace("__API__", api))
+    p = os.path.join("src", "common.rs")
+    if not os.path.exists(p):
+        print("[brand] WARNING: %s not found, skip runtime options" % p)
+        return
+    with open(p, encoding="utf-8") as f:
+        src = f.read()
+    if "pub fn brand_apply_options()" in src:
+        print("[brand] brand_apply_options already present")
+    else:
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(fn)
+        print("[brand] injected brand_apply_options() into src/common.rs")
+
+    p2 = os.path.join("src", "core_main.rs")
+    if not os.path.exists(p2):
+        print("[brand] WARNING: %s not found, skip call injection" % p2)
+        return
+    with open(p2, encoding="utf-8") as f:
+        src = f.read()
+    anchor = "    crate::load_custom_client();\n"
+    call = "    crate::common::brand_apply_options();\n"
+    if call in src:
+        print("[brand] core_main already wired")
+    elif anchor not in src:
+        print("[brand] WARNING: anchor not found in core_main.rs")
+    else:
+        src = src.replace(anchor, anchor + call, 1)
+        with open(p2, "w", encoding="utf-8") as f:
+            f.write(src)
+        print("[brand] wired brand_apply_options() into core_main()")
+
+
 def _brand_internal():
     """Compile-time branding: bake internal rendezvous server + public key in."""
     server = os.environ.get("RS_BRAND_SERVER", "").strip()
@@ -1027,6 +1096,9 @@ def _brand_internal():
     with open(p, "w", encoding="utf-8") as f:
         f.write("".join(out))
     print("[brand] baked server=%s key_len=%d" % (server, len(key)))
+
+    # 启动时把 internal server 写进本地配置（否则界面永远提示"你可以选择自建服务器"）
+    _brand_rust_runtime(server, key, os.environ.get("RS_BRAND_API", "").strip())
 
     # 清掉历史遗留的旧服务器地址（老 fork 在别处硬编码的 API server 等）
     legacy = os.environ.get("RS_BRAND_LEGACY", "").strip()
