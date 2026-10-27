@@ -19,6 +19,7 @@ env:
   RS_BRAND_SERVER: ${{ secrets.RS_BRAND_SERVER }}
   RS_BRAND_KEY: ${{ secrets.RS_BRAND_KEY }}
   RS_BRAND_API: ${{ secrets.RS_BRAND_API }}
+  RS_BRAND_LEGACY: ${{ secrets.RS_BRAND_LEGACY }}
 
 jobs:
   generate-bridge:
@@ -160,13 +161,27 @@ jobs:
         run: |
           echo "== config.rs 常量 =="
           grep -n -E 'pub const (RENDEZVOUS_SERVERS|RS_PUB_KEY)' libs/hbb_common/src/config.rs
-          echo "== 二进制里是否含目标地址 =="
-          if grep -a -c "$RS_BRAND_SERVER" ./rustdesk/rustdesk.exe 2>/dev/null; then
-            echo "OK: 服务器地址已编进 rustdesk.exe"
-          else
-            echo "WARN: 未在 rustdesk.exe 中找到服务器地址（可能被拆分成多段）"
+          echo ""
+          echo "== 真正的二进制是 librustdesk.dll（rustdesk.exe 只是外壳）=="
+          DLL=./rustdesk/librustdesk.dll
+          echo "  $DLL 大小: $(stat -c%s "$DLL" 2>/dev/null || stat -f%z "$DLL") 字节"
+          for pat in "$RS_BRAND_SERVER" "rs-ny.rustdesk.com"; do
+            c=$(grep -a -o "$pat" "$DLL" 2>/dev/null | wc -l)
+            echo "  含 $pat : $c 次"
+          done
+          if [ -n "$RS_BRAND_LEGACY" ]; then
+            c=$(grep -a -o "$RS_BRAND_LEGACY" "$DLL" 2>/dev/null | wc -l)
+            echo "  含 legacy $RS_BRAND_LEGACY : $c 次"
+            if [ "$c" != "0" ]; then
+              echo "::warning::旧服务器地址仍残留在 librustdesk.dll 中"
+            fi
           fi
-          ./rustdesk/rustdesk.exe --version || true
+          if grep -a -q "$RS_BRAND_SERVER" "$DLL"; then
+            echo "OK: 内网服务器地址已编进 librustdesk.dll"
+          else
+            echo "::error::未在 librustdesk.dll 中找到内网服务器地址"
+            exit 1
+          fi
 
       - name: find Runner.res
         continue-on-error: true
