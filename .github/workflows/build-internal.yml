@@ -1,8 +1,14 @@
 name: Build RustDesk (internal branding)
 
 # 只编 Windows x64，注入内网服务器与公钥。
-# 服务器地址/公钥来自本仓库 Secrets：RS_BRAND_SERVER / RS_BRAND_KEY / RS_BRAND_API
-# 由 build.py 的 _brand_internal() 在 cargo 编译前写进 libs/hbb_common/src/config.rs
+# 服务器地址/公钥来自本仓库 Secrets：RS_BRAND_SERVER / RS_BRAND_KEY / RS_BRAND_API / RS_BRAND_LEGACY
+# 由 build.py 的 _brand_internal() 在 cargo 编译前：
+#   1) 改写 libs/hbb_common/src/config.rs 的 RENDEZVOUS_SERVERS / RS_PUB_KEY
+#   2) 往 src/common.rs 注入 brand_apply_options()，在 core_main() 启动时写实配置项
+#   3) 清理历史遗留的旧服务器地址
+#
+# 注意：本文件所有 shell 步骤都显式处理 grep 的非零退出码。
+# GitHub Actions 的 bash 默认 -e -o pipefail，grep 无匹配返回 1 会中断整个步骤。
 
 on:
   workflow_dispatch:
@@ -156,45 +162,20 @@ jobs:
               Write-Host "Ingore the printer driver error."
           }
 
-      - name: Verify branding baked in
-        shell: bash
-        run: |
-          echo "== config.rs 常量 =="
-          grep -n -E 'pub const (RENDEZVOUS_SERVERS|RS_PUB_KEY)' libs/hbb_common/src/config.rs
-          echo ""
-          echo "== 真正的二进制是 librustdesk.dll（rustdesk.exe 只是外壳）=="
-          DLL=./rustdesk/librustdesk.dll
-          echo "  $DLL 大小: $(stat -c%s "$DLL" 2>/dev/null || stat -f%z "$DLL") 字节"
-          for pat in "$RS_BRAND_SERVER" "rs-ny.rustdesk.com"; do
-            c=$(grep -a -o "$pat" "$DLL" 2>/dev/null | wc -l)
-            echo "  含 $pat : $c 次"
-          done
-          if [ -n "$RS_BRAND_LEGACY" ]; then
-            c=$(grep -a -o "$RS_BRAND_LEGACY" "$DLL" 2>/dev/null | wc -l)
-            echo "  含 legacy $RS_BRAND_LEGACY : $c 次"
-            if [ "$c" != "0" ]; then
-              echo "::warning::旧服务器地址仍残留在 librustdesk.dll 中"
-            fi
-          fi
-          if grep -a -q "$RS_BRAND_SERVER" "$DLL"; then
-            echo "OK: 内网服务器地址已编进 librustdesk.dll"
-          else
-            echo "::error::未在 librustdesk.dll 中找到内网服务器地址"
-            exit 1
-          fi
-
       - name: find Runner.res
+        if: always()
         continue-on-error: true
         shell: bash
         run: |
-          runner_res=$(find . -name "Runner.res");
-          if [ "$runner_res" == "" ]; then
-            echo "Runner.res: not found";
+          runner_res=$(find . -name "Runner.res" || true)
+          if [ -z "$runner_res" ]; then
+            echo "Runner.res: not found"
           else
-            cp $runner_res ./libs/portable/Runner.res;
+            cp "$runner_res" ./libs/portable/Runner.res
           fi
 
       - name: Download RustDeskTempTopMostWindow artifacts
+        if: always()
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: topmostwindow-artifacts-x64
@@ -226,3 +207,55 @@ jobs:
         with:
           name: rustdesk-internal-portable-exe
           path: ./SignOutput/rustdesk-*.exe
+
+      # 校验放在最后：即使校验不通过，前面的产物也已经上传，不会白跑一轮。
+      # 所有 grep 都加了 || true，避免无匹配（退出码 1）被 -e -o pipefail 判为失败。
+      - name: Verify branding baked in
+        shell: bash
+        run: |
+          set +e
+          echo "== config.rs 常量 =="
+          grep -n -E 'pub const (RENDEZVOUS_SERVERS|RS_PUB_KEY)' libs/hbb_common/src/config.rs || true
+          echo ""
+          echo "== 启动期配置注入点 =="
+          grep -c "brand_apply_options" src/common.rs 2>/dev/null | sed 's/^/  src\/common.rs 命中: /' || true
+          grep -c "brand_apply_options" src/core_main.rs 2>/dev/null | sed 's/^/  src\/core_main.rs 命中: /' || true
+
+          echo ""
+          echo "== 二进制扫描（真正的主体是 librustdesk.dll，rustdesk.exe 只是外壳）=="
+          DLL=./rustdesk/librustdesk.dll
+          if [ ! -f "$DLL" ]; then
+            echo "::error::找不到 $DLL"
+            exit 1
+          fi
+          echo "  $DLL 大小: $(wc -c < "$DLL") 字节"
+
+          count() {
+            # grep 无匹配返回 1，这里吞掉，只输出计数
+            local n
+            n=$(grep -a -o "$1" "$DLL" 2>/dev/null | wc -l)
+            echo "${n:-0}"
+          }
+
+          SELF=$(count "$RS_BRAND_SERVER")
+          UPSTREAM=$(count "rs-ny.rustdesk.com")
+          echo "  内网服务器命中: $SELF 次"
+          echo "  上游默认域名 rs-ny.rustdesk.com: $UPSTREAM 次"
+          if [ -n "$RS_BRAND_LEGACY" ]; then
+            LEG=$(count "$RS_BRAND_LEGACY")
+            echo "  旧服务器 $RS_BRAND_LEGACY: $LEG 次"
+          fi
+
+          FAIL=0
+          if [ "${SELF:-0}" -lt 1 ]; then
+            echo "::error::librustdesk.dll 中未找到内网服务器地址"
+            FAIL=1
+          fi
+          if [ "${UPSTREAM:-0}" -ne 0 ]; then
+            echo "::error::上游默认域名仍有残留，品牌化未完全生效"
+            FAIL=1
+          fi
+          if [ -n "$RS_BRAND_LEGACY" ] && [ "${LEG:-0}" -ne 0 ]; then
+            echo "::warning::旧服务器地址仍有残留（仅 API/地址簿受影响，核心远程不受影响）"
+          fi
+          exit $FAIL
